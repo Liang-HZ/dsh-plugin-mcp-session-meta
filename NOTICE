@@ -1,0 +1,37 @@
+dsh-plugin-mcp-session-meta
+Copyright (c) 2026 Liang-HZ
+Licensed under the MIT License (see LICENSE).
+
+--------------------------------------------------------------------------
+Third-party code
+--------------------------------------------------------------------------
+
+`lib/index.js` is a DERIVED BUILD. It is the compiled
+`@deepseek-ai/dsh-mcp-client` bundle, extracted unmodified from an installed
+DeepSeek Harness application and then patched at exactly two sites.
+
+  Upstream package : @deepseek-ai/dsh-mcp-client
+  Upstream version : 0.2.0-rc.2
+  Upstream license : MIT
+  Upstream source  : https://github.com/deepseek-ai/deepseek-harness
+                     (packages/mcp/mcp-client)
+  Upstream LICENSE : reproduced verbatim in LICENSE
+
+The upstream copyright notice and permission notice are retained as required by
+the MIT License.
+
+Changes made to the derived build:
+
+  1. `clientInfo` passed to the MCP `Client` constructor gains a `title`
+     ("DeepSeek Harness") and the real harness version in place of the
+     hardcoded placeholder `"0.0.1"`.
+
+  2. `tools/call` request params gain an optional
+     `_meta: { session_id: <agent session id> }`, taken from
+     `execution.agent.id` when an Agent is present on the tool execution.
+
+Nothing else is altered. `sync.mjs` reconstitutes this file from the installed
+application and asserts on both patch sites; if the upstream shape changes it
+fails rather than emitting an unpatched artifact.
+
+This project is not affiliated with, endorsed by, or sponsored by DeepSeek.

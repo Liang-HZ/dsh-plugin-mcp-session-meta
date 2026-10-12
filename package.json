@@ -1,8 +1,15 @@
 {
-  "name": "dsh-mcp-client-session-meta",
-  "version": "0.2.0-rc.2",
-  "private": true,
-  "description": "DeepSeek Harness MCP client bridge: upstream @deepseek-ai/dsh-mcp-client with the calling Agent's session id carried in tools/call params._meta",
+  "name": "dsh-plugin-mcp-session-meta",
+  "version": "0.1.0",
+  "description": "DeepSeek Harness MCP client bridge that carries the calling Agent's session id in tools/call params._meta, so MCP servers can tell which conversation is calling.",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "mcp",
+    "mcp-client",
+    "session"
+  ],
   "license": "MIT",
   "type": "module",
   "main": "lib/index.js",
@@ -13,12 +20,28 @@
     "./package.json": "./package.json"
   },
   "files": [
-    "lib/index.js"
+    "lib/index.js",
+    "sync.mjs",
+    "install.mjs",
+    "README.md",
+    "README.zh.md",
+    "LICENSE",
+    "NOTICE"
   ],
+  "engines": {
+    "node": ">=22.15"
+  },
   "scripts": {
     "sync": "node sync.mjs",
-    "check": "node sync.mjs --check"
+    "check": "node sync.mjs --check",
+    "install-profile": "node install.mjs",
+    "prepublishOnly": "node sync.mjs --check"
   },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Liang-HZ/dsh-plugin-mcp-session-meta.git"
+  },
+  "author": "Liang-HZ",
   "peerDependencies": {
     "@deepseek-ai/dsh-attachment": "workspace:*",
     "@deepseek-ai/dsh-scope": "workspace:*",
@@ -28,5 +51,8 @@
     "@deepseek-ai/dsh-util-values": "workspace:*",
     "@deepseek-ai/schemastery": "*",
     "@modelcontextprotocol/client": "*"
+  },
+  "bin": {
+    "dsh-plugin-mcp-session-meta": "./install.mjs"
   }
 }

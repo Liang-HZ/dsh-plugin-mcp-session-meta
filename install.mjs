@@ -68,6 +68,16 @@ function entryInfo(text) {
 }
 
 /**
+ * 一条注册项归不归本包管：**上游的 MCP 客户端桥，或已经指向本包的那一条**。
+ *
+ * 两个都要认：只认上游的话，装完之后 `--list` 就找不到自己了（本包的名字里没有
+ * `dsh-mcp-client` 这一段）；只认自己也一样——第一次装的时候配置里写的还是上游名。
+ */
+function isBridgeModule(module) {
+  return /dsh-mcp-client/.test(module) || module === NAME;
+}
+
+/**
  * profile 里所有 **MCP 客户端桥**注册项。判据是模块名，不是 serverName：
  * 谁注册进来的、那个 server 叫什么，跟本包无关——用户可能装了十几个。
  */
@@ -75,7 +85,7 @@ function mcpEntries(lines) {
   const out = [];
   for (const r of itemRanges(lines)) {
     const info = entryInfo(lines.slice(r.start, r.end).join("\n"));
-    if (!info.module || !/dsh-mcp-client/.test(info.module)) continue;
+    if (!info.module || !isBridgeModule(info.module)) continue;
     let nameLine = null;
     for (let i = r.head; i < r.end; i++) {
       if (/^\s+name:\s/.test(lines[i])) {
@@ -128,24 +138,54 @@ function linkPath(dir) {
   return path.join(dir, "node_modules", NAME);
 }
 
-function ensureLink(dir) {
+/** 稳定安装位：从 npx / node_modules 里跑时，包必须复制到这儿再链——那些目录会被清掉 */
+function stableDir(home) {
+  return path.join(home, ".dsh", "plugins", NAME);
+}
+
+/** HERE 是不是躺在一个随时会被清掉的缓存/依赖目录里（npx 缓存、pnpm store、npm _cacache） */
+function inVolatileDir(p) {
+  return p.split(path.sep).includes("node_modules") || /[\\/]_npx[\\/]/.test(p) || /[\\/]_cacache[\\/]/.test(p);
+}
+
+/** 随包走的那些文件——复制和 files 白名单同一份，免得两处漂移 */
+const SHIPPED = ["lib", "package.json", "sync.mjs", "install.mjs", "README.md", "README.zh.md", "LICENSE", "NOTICE"];
+
+/**
+ * 决定从哪个目录链进 profile：克隆出来的目录直接用（改完代码立刻生效），
+ * 从 npx / node_modules 里跑的则先复制一份到 `~/.dsh/plugins/<name>`——
+ * npx 的缓存目录会被清理，链过去等于给自己埋一个「过几天 MCP 起不来」。
+ */
+function materialize(home, { force = false } = {}) {
+  if (!force && !inVolatileDir(HERE)) return { dir: HERE, copied: false };
+  const dest = stableDir(home);
+  fs.rmSync(dest, { recursive: true, force: true });
+  fs.mkdirSync(dest, { recursive: true });
+  for (const f of SHIPPED) {
+    const src = path.join(HERE, f);
+    if (fs.existsSync(src)) fs.cpSync(src, path.join(dest, f), { recursive: true });
+  }
+  return { dir: dest, copied: true };
+}
+
+function ensureLink(dir, target) {
   const link = linkPath(dir);
   fs.mkdirSync(path.dirname(link), { recursive: true });
   let cur = null;
   try {
     cur = fs.readlinkSync(link);
   } catch {}
-  if (cur === HERE) return "已就位";
+  if (cur === target) return "已就位";
   if (cur) {
     fs.unlinkSync(link);
-    fs.symlinkSync(HERE, link, "dir");
-    return `改指向 ${cur} → ${HERE}`;
+    fs.symlinkSync(target, link, "dir");
+    return `改指向 ${cur} → ${target}`;
   }
   if (fs.existsSync(link)) {
     // 真目录（不是链接）：不动它，让人自己看
     throw new Error(`${link} 是个真目录而不是链接，没敢覆盖`);
   }
-  fs.symlinkSync(HERE, link, "dir");
+  fs.symlinkSync(target, link, "dir");
   return "新建链接";
 }
 
@@ -186,8 +226,22 @@ function main() {
     } catch {}
     if (cur === HERE) ok(`链接就位 ${link}`);
     else bad(`链接不对：${link} → ${cur === null ? "（不存在）" : cur}`);
+    if (inVolatileDir(HERE)) bad(`本脚本正从缓存目录里跑（${HERE}）——装之前请先复制到固定位置`);
   } else {
-    ok(`链接 ${ensureLink(dir)}`);
+    const { dir: installDir, copied } = materialize(home, { force: argv.includes("--copy") });
+    if (copied) ok(`已复制到固定位置 ${installDir}`);
+    // 装之前先把产物对齐到**这台机器上的** DSH：随包发出去的 lib/index.js 是按作者那版
+    // app.asar 生成的，版本不同就是另一份编译产物。锚点对不上 sync.mjs 会硬失败——那正是
+    // 要的信号（说明这个 DSH 版本还没适配），不能吞掉，所以这里原样透传它的输出。
+    const r = spawnSync(process.execPath, [path.join(installDir, "sync.mjs")], { encoding: "utf8", cwd: installDir });
+    if (r.status !== 0) {
+      bad("按本机的 DSH 重新生成产物失败——这个版本可能还没适配：");
+      process.stdout.write(r.stdout || "");
+      process.stderr.write(r.stderr || "");
+      process.exit(1);
+    }
+    ok("产物已按本机安装的 DSH 重新生成");
+    ok(`链接 ${ensureLink(dir, installDir)}`);
   }
 
   // ---- 2. 配置里那一条的模块名

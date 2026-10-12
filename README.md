@@ -1,135 +1,138 @@
-# dsh-mcp-client-session-meta
+# dsh-plugin-mcp-session-meta
 
-给 DeepSeek Harness 的 MCP 客户端补上**协议级的会话归属**：每次 `tools/call` 的
-`params._meta.session_id` 填上调用方那一轮对话的 SessionId。
+Makes **DeepSeek Harness** tell MCP servers *which conversation* is calling.
 
-## 为什么
+Every `tools/call` the harness sends gets the calling Agent's session id in
+`params._meta.session_id`. That is the one piece of information an MCP server
+needs to keep per-conversation state — and the one DSH currently leaves blank.
 
-@deepseek-ai/dsh-mcp-client 把 `{name, arguments}` 当 params 直接交给 SDK
-（`client.callTool(params, …)` → `request({method:"tools/call", params})`，params 原样上线），
-而 MCP 的 `BaseRequestParamsSchema` **本来就带一个可选的 `_meta`**——
+> Chinese documentation: [README.zh.md](README.zh.md).
+> This is an **unofficial community plugin** — not affiliated with or endorsed by
+> DeepSeek.
+
+## The problem
+
+DSH's MCP client passes `{ name, arguments }` straight through as the request
+params, leaving `_meta` empty:
+
+```js
+call: (args, execution) => client.callTool({ name: tool.name, arguments: args }, { … })
+```
+
+But `_meta` is a first-class optional field of MCP's `BaseRequestParamsSchema`:
 
 ```js
 const BaseRequestParamsSchema = z.object({ _meta: RequestMetaSchema.optional() })
 ```
 
-也就是说协议级的归属通道一直是现成的，只是没被用。后果在 MCP server 侧很具体：
-它只能看到「这个进程」，看不到「这一轮对话」。像 agent-in-chrome 那种要按对话隔离标签页的
-服务端，就只能回落到「一个 MCP 进程一个 sid」——同一台 DSH 里所有对话共享一份清单。
+So a server can only ever see *the process*, never *the conversation*. For a
+server whose state is per-conversation — browser automation with tab groups,
+editors, anything with sessions — every conversation in the harness shares one
+bucket and the server has no way to tell them apart.
 
-agent loop 在派发工具时已经把身份填好了（`ToolExecutionInput.agent`，注释写着
-"The agent on whose behalf the call runs"），`agent.id` 就是 SessionId。差的就是把它递下去。
+Other MCP clients already send it: ZCode sends `session_id`, Antigravity sends
+`antigravity.google/conversation_id`, Codex sends `thread_id`, WorkBuddy sends
+`workbuddy.ai/conversationId`. DSH is the odd one out.
 
-## 它是怎么来的
+The identity is already sitting at the call site — the agent loop sets
+`ToolExecutionInput.agent` (*"The agent on whose behalf the call runs"*), and
+`agent.id` **is** the SessionId. It is simply not forwarded.
 
-上游仓库（deepseek-ai/deepseek-harness）明确**不收外部 PR**，而 app.asar 有 integrity 校验、
-外层还有代码签名——改包里的文件既破坏签名、又会在每次更新时被覆盖。所以这份产物是
-**提取 + 打补丁 + 可重生成**，而不是「拷一份改好的冻住」：
+## What it changes
 
-```
-node sync.mjs          # 从已安装的 DSH 重新生成 lib/index.js
-node sync.mjs --check  # 上游变了没有（变了就重新生成）
-```
+Two patches, both in the derived artifact:
 
-`sync.mjs` 做四件事，任何一件对不上都**硬失败**（宁可生成不出来，也不产出一个没打补丁的副本）：
+| Patch | Before | After |
+|---|---|---|
+| `clientInfo` | `{ name: "dsh-mcp-client", version: "0.0.1" }` — a middleware self-report with a placeholder version | `{ name, title: "DeepSeek Harness", version: "<real>" }` |
+| `tools/call` params | `{ name, arguments }` | `{ name, arguments, _meta: { session_id: <agent.id> } }` |
 
-1. 从 app.asar 取出上游 `lib/index.js`（asar 的数据段在 JSON 目录之后**补齐到 4 字节边界**，
-   少算这一步每条记录都会整体前移 2 字节——文本还能 grep，JSON 直接解析不了）；
-2. 补 `clientInfo`：上游硬编码 `{name:"dsh-mcp-client", version:"0.0.1"}`，name 是中间件自己的
-   包名、version 是占位符。补上 `title: "DeepSeek Harness"` 与真实版本
-   （`BaseMetadataSchema = {name, title?}` 是协议里就有的字段）；
-3. 补 `_meta.session_id`：把 `callTool` 的 params 换成 `sessionCallParams(...)`，
-   有 `execution.agent.id` 才带这个键，没有就**不带**（缺键是「这一帧不知道」，
-   带个空值反而是在声称知道）；
-4. 从产物里**数出**它 import 到的外部包，写进 `package.json` 的 `peerDependencies`。
+`_meta` is omitted entirely when there is no Agent on the execution (nested
+dispatches) — a missing key means "this frame doesn't know", which is different
+from claiming a session.
 
-第 4 条不是形式主义：运行时的解析器是**按 peer 声明供给**的（上游 app-boot 的
-`profile-resolution/resolver.ts`：「Linked importers apply current peer declarations at each
-ancestor node_modules」——它读导入方自己 manifest 里的 peer 名单）。一个都不声明，插件在导入
-阶段就死，表现是 fiber 直接变成 disposed，连一句有意义的错误都没有。
+## Install
 
-## 装
+The artifact has to be regenerated against **your** installed DSH, because the
+patch targets DeepSeek's *compiled* bundle and that changes between releases.
 
-```
-node install.mjs                 # 装进 ~/.dsh/profiles/desktop
-node install.mjs --profile web   # 指定 profile
-node install.mjs --check         # 只检查
-node install.mjs --uninstall     # 摘掉
+```bash
+git clone https://github.com/Liang-HZ/dsh-plugin-mcp-session-meta
+cd dsh-plugin-mcp-session-meta
+
+node sync.mjs                  # extract from your app.asar + patch (fails loudly if the anchors moved)
+node install.mjs --list        # show the MCP entries in your profile
+node install.mjs --server NAME # point that one entry at this package
 ```
 
-它做两件事：在 profile 的 `node_modules` 下挂一个指向本目录的符号链接；把 profile 的
-`cordis.patch.yml` 里那条 agent-in-chrome 注册项的 `name` 换成我们（改前备份）。
+Then **restart DSH** — see *Caching* below.
 
-**为什么用新名字而不是顶掉上游包名**：把本包命名成 `@deepseek-ai/dsh-mcp-client` 塞进
-`node_modules` 能让配置一个字都不用改，但那会成一份**隐形的影子包**——DSH 升级后它继续跑旧代码，
-而盘上没有任何东西看得出这件事。用自己名字的代价是这里得改一行，收益是配置里写着「这条走的是谁」。
+- `--profile web` — target another profile (default `desktop`)
+- `--check` — report only, change nothing
+- `--uninstall` — put the entry back to the upstream package
 
-### ⚠️ 改完必须重启 DSH
+Only the entry you name is switched; other MCP servers keep using the upstream
+client. Nothing else in the harness changes.
 
-**实测（2026-10-12）**：DSH 对插件模块有缓存——改插件的代码、甚至改条目指向的包名，
-都不会让新代码生效：
+### Caching: a restart is required
 
-- Node 的 ESM 缓存按 URL 命中，同一个文件路径第二次导入拿到的是**旧模块对象**；
-- 插件管理器 `set_plugin` 的启用/停用**只重新跑已导入模块的 `apply`**，不重新导入；
-- desktop profile 的 `package.json` 里没有 `web` profile 那份 `patchReload: "live"`。
+DSH caches imported plugin modules. Editing plugin code — or even changing which
+package an entry points at — does **not** take effect live: Node's ESM cache is
+keyed by URL, and the plugin manager's enable/disable only re-runs `apply()` on
+the already-imported module. A restart (or a brand-new entry id) is the only
+thing that re-imports. Expect "the entry is active, the module name changed, and
+it still runs the old code" until you restart.
 
-所以本机验证时「条目已激活、`moduleName` 也变了、却仍跑旧行为」是常态而不是异常。
-**改动要生效只有两条路**：重启 DSH，或者给条目换一个全新的 `id`（新条目才会重新导入）。
+## Compatibility
 
-### 和 agent-in-chrome 安装器的相互作用
+- Built and tested against `@deepseek-ai/dsh-mcp-client` **0.2.0-rc.2**
+  (DeepSeek Harness 0.2.0-rc.2, macOS).
+- `sync.mjs` asserts on both patch anchors. If a DSH upgrade moves them it
+  **fails** rather than emitting an unpatched artifact — a silently unpatched
+  copy is the worst outcome here, because the plugin would still load and simply
+  stop doing anything.
+- Node ≥ 22.15 (extraction uses `zlib.zstdDecompressSync`).
 
-agent-in-chrome 的 `scripts/install.mjs` 重建那条注册项时，会把 `name` 写回
-`@deepseek-ai/dsh-mcp-client`——也就是把这一行覆盖掉。**2026-10-12 实测复现过一次**：
-运行 `install.mjs --agents=deepseek-harness` 同步运行时时，配置那行当场被改了回去
-（有意思的是跑着的客户端仍是补丁版——模块缓存没让它切走——但**下次重启就会静默退回内置版**）。
+## How it is built (and why not a plain fork)
 
-两条出路：
+DeepSeek's harness repository does not accept external pull requests, and the app
+bundle is code-signed with per-file integrity hashes — editing files inside
+`app.asar` breaks the signature and is overwritten by every update.
 
-- 只想同步 agent-in-chrome 的运行时、不想动 agent 注册：加 `--no-agents`
-  （`node scripts/install.mjs --no-agents --yes`），它跳过整个注册环节，配置一个字都不碰；
-- 已经跑了全量注册：补一次 `node install.mjs` 即可恢复，`node install.mjs --check`
-  会直接报出「被覆盖了」。
+So the artifact is **extracted, patched and regenerable** rather than a frozen
+copy:
 
-## 状态：已实测通过
-
-DSH 重启后（2026-10-12，0.2.0-rc.2），线上帧里的 `rpcMeta` 实际长这样：
-
-```json
-{
-  "io.modelcontextprotocol/protocolVersion": "2026-07-28",
-  "io.modelcontextprotocol/clientInfo": {
-    "name": "dsh-mcp-client", "title": "DeepSeek Harness", "version": "0.2.0-rc.2"
-  },
-  "io.modelcontextprotocol/clientCapabilities": {},
-  "session_id": "session-4cc66452-c277-42ad-b234-8a28492100e8"
-}
+```bash
+node sync.mjs          # regenerate lib/index.js from the installed app
+node sync.mjs --check  # is the artifact still what this DSH would generate?
 ```
 
-两处补丁都到了线上（`title` 之前是 null、版本是占位符 `0.0.1`）。服务端 MCP 侧的归属随之
-从进程级切成对话级：
+`sync.mjs` also reads the external modules the bundle imports and writes them
+into `peerDependencies`. That is not bookkeeping: DSH's profile resolver supplies
+packages **by peer declaration** ("Linked importers apply current peer
+declarations at each ancestor node_modules"). An undeclared peer is not supplied,
+and the plugin dies during import with no useful error. Deriving the list from
+the artifact keeps it in step automatically.
 
-```
-session        s81189-mv4zegzs   →   s81189-mv4zegzs::session-4cc66452-…
-sessionOrigin  from:"fallback"   →   from:"_meta.session_id"
-               caller: null       →   caller:"session-4cc66452-…"
-```
+## Notes for other DSH plugin authors
 
-合起来，这一轮对话在 MCP 服务端眼里的四段身份：
+Two things that cost real time to discover:
 
-```json
-{ "brand": "DeepSeek Harness", "surface": "app",
-  "workspace": "onework-agent", "workspaceKind": "git",
-  "session": "为 dsh 安装 agent in chrome MCP" }
-```
+1. **Declare every package you import as a `peerDependency`.** The resolver in
+   `@deepseek-ai/dsh-app-boot` reads the importing package's own manifest to
+   decide what to supply. Miss one and the fiber ends up `DISPOSED` with a bare
+   `fiber state 4` and no message.
+2. **`patchReload: "live"` is a profile setting.** The shipped `web` profile has
+   it; a profile without it will not pick up patch edits without a restart.
 
-其余已验证：产物从当前安装的 DSH 生成、语法通过、两处补丁就位（`sync.mjs --check` 通过）；
-8 个 peer 从产物自动数出；包能被 profile 解析、条目 `fiberPhase: active`。
+## When to delete this
 
-## 卸载
+When DSH forwards the session id itself. The upstream fix is small — the identity
+is already in scope at the call site — and this plugin exists only to fill the gap
+in the meantime.
 
-```
-node install.mjs --uninstall     # 摘链接 + name 还原为上游
-rm -rf ~/.dsh/profiles/desktop/node_modules/dsh-mcp-client-session-meta
-```
+## License
 
-`lib/index.js` 是 MIT 代码（@deepseek-ai/dsh-mcp-client）的派生，随包带上上游 LICENSE。
+MIT. The derived `lib/index.js` is a patched build of
+[`@deepseek-ai/dsh-mcp-client`](https://www.npmjs.com/package/@deepseek-ai/dsh-mcp-client)
+(MIT, © DeepSeek). See [NOTICE](NOTICE).

@@ -4,21 +4,27 @@
 // 做两件事，都是幂等的：
 //   1. 在 profile 的 node_modules 下挂一个指向本目录的符号链接（profile 的 node_modules
 //      是加载器的第一锚点：pnpm 管的条目先于安装自带的解析）。
-//   2. 把 profile 的 cordis.patch.yml 里那条 agent-in-chrome 注册项的 name 换成我们。
+//   2. 把 profile 的 cordis.patch.yml 里**那一条** MCP 客户端注册项的 name 换成我们。
 //
 // **为什么要换 name 而不是顶掉上游的包名**：挂在别人的包名上（把本包命名成
 // `@deepseek-ai/dsh-mcp-client` 塞进 node_modules）能让配置一个字都不用改，但那就成了一份
 // 隐形的影子包——DSH 升级后它继续跑旧代码，而盘上没有任何东西看得出这件事。用一个自己的
 // 名字，配置里就写着「这条走的是谁」，代价是这里得改一行。
 //
-// **已知交互**：agent-in-chrome 的安装器（scripts/install.mjs）重建那条注册项时会把
-// name 写回 `@deepseek-ai/dsh-mcp-client`——也就是把这一行覆盖掉。那之后跑一次
-// `node install.mjs` 即可恢复；`node install.mjs --check` 会直接报出「被覆盖了」。
+// **只改你指定的那一条**：一个 profile 里可能挂着十几个 MCP server，谁走补丁是你的选择。
+// 不写 serverName 时只有一条才敢动，多条会先列出来让你用 `--server` 点名。
 //
-//   node install.mjs                    # 装进 ~/.dsh/profiles/desktop
-//   node install.mjs --profile web      # 指定 profile
-//   node install.mjs --check            # 只检查，不写盘
-//   node install.mjs --uninstall        # 摘掉（只摘我们写的那两处）
+//   node install.mjs --list                 # 先看看有哪些注册项、各指向什么
+//   node install.mjs                        # 装（只有一条注册项时）
+//   node install.mjs --server my-browser    # 装（多条时点名）
+//   node install.mjs --profile web          # 指定 profile，默认 desktop
+//   node install.mjs --check                # 只检查，不写盘
+//   node install.mjs --uninstall            # 摘掉（只摘我们写的那两处）
+//
+// **已知交互**：如果那条注册项是别人的安装器写的（比如 agent-in-chrome 的
+// scripts/install.mjs），对方重建它时会把 name 写回 `@deepseek-ai/dsh-mcp-client`——
+// 也就是把这一行覆盖掉。那之后重跑一次本脚本即可恢复，`--check` 会直接报出来。
+// 想避免这个来回：同步运行时加 `--no-agents` 跳过整个注册环节。
 
 import fs from "node:fs";
 import os from "node:os";
@@ -30,13 +36,15 @@ const HERE = fs.realpathSync(path.dirname(fileURLToPath(import.meta.url)));
 const PKG = JSON.parse(fs.readFileSync(path.join(HERE, "package.json"), "utf8"));
 const NAME = PKG.name;
 
-/** 这条注册项在配置里的标识（agent-in-chrome 安装器写的那个） */
-const SERVER_NAME = "agent-in-chrome";
-const ENTRY_ID = "mcp-agent-in-chrome";
+/*
+ * 本包替换的是**某一条** MCP 客户端注册项，不是全部。一个 profile 里可能挂着十几个
+ * server（浏览器、数据库、文件系统……），谁走补丁是用户自己的选择，所以这里不写死任何
+ * serverName：注册项的判据是**模块名**（模块名里带 `dsh-mcp-client`），要改哪一条用
+ * `--server <serverName>` 指定；不指定时只有一条才敢动。
+ */
 
 const ok = (m) => console.log(`  \x1b[32m✓\x1b[0m ${m}`);
 const bad = (m) => console.log(`  \x1b[31m✗\x1b[0m ${m}`);
-const warn = (m) => console.log(`  \x1b[33m!\x1b[0m ${m}`);
 
 function profileDir(home, name) {
   return path.join(home, ".dsh", "profiles", name);
@@ -49,29 +57,62 @@ function itemRanges(lines) {
   return heads.map((h, k) => ({ start: h, end: k + 1 < heads.length ? heads[k + 1] : lines.length, head: h }));
 }
 
-/** 这一项是不是那条 agent-in-chrome 注册（认 serverName，或认条目 id） */
-function isOurEntry(text) {
-  return (
-    new RegExp(`serverName:\\s*['"]?${SERVER_NAME}['"]?\\s*$`, "m").test(text) ||
-    new RegExp(`-\\s+id:\\s*['"]?${ENTRY_ID}['"]?\\s*$`, "m").test(text)
-  );
+/** 从一项里读出这条注册：条目 id、模块名、config 里的 serverName。读不出模块名就不是我们管得着的 */
+function entryInfo(text) {
+  const grab = (re) => re.exec(text)?.[1] ?? null;
+  return {
+    id: grab(/^\s+-\s+id:\s*['"]?([\w.@/-]+)['"]?\s*$/m),
+    module: grab(/^\s+name:\s*['"]?([\w.@/-]+)['"]?\s*$/m),
+    serverName: grab(/^\s+serverName:\s*['"]?([\w.-]+)['"]?\s*$/m),
+  };
+}
+
+/**
+ * profile 里所有 **MCP 客户端桥**注册项。判据是模块名，不是 serverName：
+ * 谁注册进来的、那个 server 叫什么，跟本包无关——用户可能装了十几个。
+ */
+function mcpEntries(lines) {
+  const out = [];
+  for (const r of itemRanges(lines)) {
+    const info = entryInfo(lines.slice(r.start, r.end).join("\n"));
+    if (!info.module || !/dsh-mcp-client/.test(info.module)) continue;
+    let nameLine = null;
+    for (let i = r.head; i < r.end; i++) {
+      if (/^\s+name:\s/.test(lines[i])) {
+        nameLine = i;
+        break;
+      }
+    }
+    out.push({ ...r, ...info, nameLine });
+  }
+  return out;
 }
 
 function readPatch(file) {
   return fs.readFileSync(file, "utf8").split("\n");
 }
 
-/** 找到那条注册项并返回 { start, end, head, nameLine } */
-function findEntry(lines) {
-  for (const r of itemRanges(lines)) {
-    const text = lines.slice(r.start, r.end).join("\n");
-    if (!isOurEntry(text)) continue;
-    for (let i = r.head; i < r.end; i++) {
-      if (/^\s+name:\s/.test(lines[i])) return { ...r, nameLine: i };
-    }
-    return { ...r, nameLine: null };
+/** 这条注册现在指向哪个模块（去掉 YAML 的引号，好读也好比） */
+function moduleOf(entry, lines) {
+  if (entry.nameLine === null) return null;
+  return (
+    lines[entry.nameLine]
+      .replace(/^\s+name:\s*/, "")
+      .trim()
+      .replace(/^['"]|['"]$/g, "")
+  );
+}
+
+/** 把候选全列出来——用 --server 指哪一条之前，得先让人看见有哪些 */
+function printEntries(entries, lines) {
+  console.log("  这个 profile 里的 MCP 客户端注册项：\n");
+  for (const e of entries) {
+    const cur = moduleOf(e, lines);
+    console.log(`    serverName  ${e.serverName ?? "（没有这一行）"}`);
+    console.log(`      条目 id   ${e.id ?? "（没有）"}`);
+    console.log(`      模块      ${cur ?? "（没有 name 行）"}${cur && cur.includes(NAME) ? "   ← 本包" : ""}`);
   }
-  return null;
+  console.log("");
 }
 
 function backup(file) {
@@ -115,6 +156,9 @@ function main() {
   const profileName = pIdx >= 0 ? argv[pIdx + 1] : "desktop";
   const check = argv.includes("--check");
   const uninstall = argv.includes("--uninstall");
+  const list = argv.includes("--list");
+  const sIdx = argv.indexOf("--server");
+  const want = sIdx >= 0 ? argv[sIdx + 1] : null;
 
   const dir = profileDir(home, profileName);
   const patch = path.join(dir, "cordis.patch.yml");
@@ -146,18 +190,33 @@ function main() {
     ok(`链接 ${ensureLink(dir)}`);
   }
 
-  // ---- 2. 配置里的 name
+  // ---- 2. 配置里那一条的模块名
   if (!fs.existsSync(patch)) {
-    bad(`找不到 ${patch}（agent-in-chrome 还没注册到这个 profile？）`);
+    bad(`找不到 ${patch}——这个 profile 还没注册过 MCP server？`);
     process.exit(1);
   }
   const lines = readPatch(patch);
-  const entry = findEntry(lines);
-  if (!entry) {
-    bad(`${path.basename(patch)} 里没有 serverName: ${SERVER_NAME} 的注册项——先装 agent-in-chrome`);
+  const entries = mcpEntries(lines);
+  if (!entries.length) {
+    bad(`${path.basename(patch)} 里没有 MCP 客户端注册项（模块名里带 dsh-mcp-client 的那些）`);
     process.exit(1);
   }
-  const cur = entry.nameLine === null ? null : lines[entry.nameLine].replace(/^\s+name:\s*/, "").trim();
+  if (list) {
+    printEntries(entries, lines);
+    return;
+  }
+  if (!want && entries.length > 1) {
+    printEntries(entries, lines);
+    bad("有多条，用 --server <serverName> 指定要接哪一条");
+    process.exit(1);
+  }
+  const entry = want ? (entries.find((e) => e.serverName === want) ?? null) : entries[0];
+  if (!entry) {
+    printEntries(entries, lines);
+    bad(`没有 serverName 为 ${want} 的注册项`);
+    process.exit(1);
+  }
+  const cur = moduleOf(entry, lines);
 
   if (uninstall) {
     if (cur && cur.includes(NAME)) {

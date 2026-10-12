@@ -131,6 +131,11 @@ When DSH forwards the session id itself. The upstream fix is small — the ident
 is already in scope at the call site — and this plugin exists only to fill the gap
 in the meantime.
 
+That request is filed here, with the exact change and the evidence:
+**https://github.com/deepseek-ai/deepseek-harness/discussions/9519**
+
+If it lands, this package is dead weight — uninstall it.
+
 ## License
 
 MIT. The derived `lib/index.js` is a patched build of

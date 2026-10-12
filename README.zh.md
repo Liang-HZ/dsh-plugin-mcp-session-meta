@@ -123,6 +123,11 @@ DSH 的解析器是**按 peer 声明供给**包的（上游 app-boot 的 `profil
 等 DSH 自己把 session id 透传下来。上游那处改动很小——身份本来就在调用点的作用域里——
 本插件只是为了在这之前把缺口补上。
 
+这个请求已经提上去了，带着确切的改法和证据：
+**https://github.com/deepseek-ai/deepseek-harness/discussions/9519**
+
+它一旦落地，这个包就是纯负担——卸掉。
+
 ## 许可
 
 MIT。派生的 `lib/index.js` 是
